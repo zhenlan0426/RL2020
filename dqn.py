@@ -69,7 +69,7 @@ class ExperienceBuffer:
     
     @staticmethod 
     def convert(x):
-        return torch.tensor(x).to(device)
+        return torch.tensor(np.array(x)).to(device)
     
 class Agent(object):
     def __init__(self, model: nn.Module, tgt: nn.Module, opt: Optimizer, action_space: int, gamma: float, clip: float):
@@ -124,8 +124,8 @@ class Agent(object):
 def Trainer(ENV_NAME,
             episode=1000,
             GAMMA = 0.99,
-            BATCH_SIZE = 128,
-            REPLAY_SIZE = 100000,
+            BATCH_SIZE = 32,
+            REPLAY_SIZE = 10000,
             LEARNING_RATE = 1e-4,
             SYNC_TARGET_FRAMES = 1000,
             REPLAY_START_SIZE = 10000,
@@ -133,7 +133,8 @@ def Trainer(ENV_NAME,
             EPSILON_START = 1.0,
             EPSILON_FINAL = 0.02,
             clip = 1.0,
-            report_freq=10):
+            report_freq=10,
+            opt_level='O0'):
     
     # setup
     since = time.time()
@@ -142,7 +143,7 @@ def Trainer(ENV_NAME,
     tgt = DQN(env.observation_space.shape, env.action_space.n).to(device)
     tgt.eval()
     opt = Adam(model.parameters(), lr=LEARNING_RATE)
-    model, opt = amp.initialize(model, opt, opt_level="O2")
+    model, opt = amp.initialize(model, opt, opt_level=opt_level)
     buffer = ExperienceBuffer(REPLAY_SIZE)
     agent = Agent(model,tgt,opt,env.action_space.n,GAMMA,clip)
     
@@ -190,6 +191,6 @@ def Trainer(ENV_NAME,
             
     
 if __name__ == "__main__":
-    Trainer('PongNoFrameskip-v4')    
+    model = Trainer('PongNoFrameskip-v4')    
     
     
