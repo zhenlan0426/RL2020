@@ -25,13 +25,13 @@ class DQN(nn.Module):
 
         self.conv = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
-            nn.BatchNorm2d(32),
+            #nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.BatchNorm2d(64),
+            #nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.BatchNorm2d(64),
+            #nn.BatchNorm2d(64),
             nn.ReLU()
         )
 
@@ -90,9 +90,9 @@ class Agent(object):
             return out
         state = torch.tensor(state[None],dtype=torch.float32).to(device)
         with torch.no_grad():
-            self.model.eval()
+            #self.model.eval()
             out = self.model(state).max(1)[1]
-            self.model.train()
+            #self.model.train()
             return out.item()
     
     def acts(self,states: np.ndarray, eps: float) -> np.ndarray:
@@ -132,7 +132,7 @@ def Trainer(ENV_NAME,
             EPSILON_DECAY_LAST_FRAME = 10**5,
             EPSILON_START = 1.0,
             EPSILON_FINAL = 0.02,
-            clip = 1.0,
+            clip = 2.0,
             report_freq=10,
             opt_level='O0'):
     
@@ -172,6 +172,7 @@ def Trainer(ENV_NAME,
             frame_idx += 1
             if frame_idx < REPLAY_START_SIZE: continue
                 
+        
             # train model
             batch = buffer.sample(BATCH_SIZE)
             agent.update(batch)
@@ -184,13 +185,14 @@ def Trainer(ENV_NAME,
             ts = time.time()
             mean_r = np.mean(tot_rewards[-report_freq:])
             print('episode:{}, frame:{}, reward:{}, speed:{}'.format(i,frame_idx,mean_r,speed))
-            if mean_r > 18: 
+            if mean_r > 19: 
                 time_elapsed = time.time() - since
-                print('Training completed in {} mins with {} episode'.format(time_elapsed/60),i)
+                print('Training completed in {} mins with {} episode'.format(time_elapsed/60,i))
                 return model
             
     
 if __name__ == "__main__":
-    model = Trainer('PongNoFrameskip-v4')    
-    
+    model = Trainer('PongNoFrameskip-v4')
+    if model is not None:
+        torch.save(model.state_dict(), '/home/will/Desktop/kaggle/RL/dqn.bin')
     
