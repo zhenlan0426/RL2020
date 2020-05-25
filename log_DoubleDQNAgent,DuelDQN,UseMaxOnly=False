@@ -1,0 +1,16 @@
+episode:0, frame:896, reward:-20.0, speed:1048.3343916831668
+episode:10, frame:9427, reward:-20.7, speed:1195.9397171853295
+episode:20, frame:18328, reward:-20.7, speed:158.60107232567043
+episode:30, frame:27723, reward:-20.4, speed:146.6453460125244
+episode:40, frame:37706, reward:-20.0, speed:147.19082558373734
+episode:50, frame:48922, reward:-19.7, speed:139.76170561988846
+episode:60, frame:62979, reward:-17.8, speed:136.30974932993206
+episode:70, frame:79941, reward:-18.2, speed:139.52535830962483
+episode:80, frame:103003, reward:-15.1, speed:137.62619326940333
+episode:90, frame:136402, reward:-12.4, speed:136.92397686550873
+episode:100, frame:178595, reward:-1.7, speed:139.19951627199328
+episode:110, frame:204306, reward:13.1, speed:137.36295563843134
+episode:120, frame:226814, reward:15.1, speed:133.05282275341608
+episode:130, frame:246311, reward:18.2, speed:132.5704667401968
+episode:140, frame:264917, reward:19.3, speed:134.6624966729843
+Training completed in 30.97950223684311 mins with 140 episode

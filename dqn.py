@@ -16,22 +16,19 @@ import collections
 from wrappers import make_env
 import time
 from typing import List
-#import pdb 
+#import pdb pdb.set_trace()
 device = 'cuda'
 
 class DQN(nn.Module):
     def __init__(self, input_shape, n_actions):
         super(DQN, self).__init__()
-
+        # BN hurts performance for pong
         self.conv = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
-            #nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            #nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            #nn.BatchNorm2d(64),
             nn.ReLU()
         )
 
@@ -50,6 +47,39 @@ class DQN(nn.Module):
         conv_out = self.conv(x).view(x.size()[0], -1)
         return self.fc(conv_out)
 
+class DuelDQN(nn.Module):
+    def __init__(self, input_shape, n_actions):
+        super(DuelDQN, self).__init__()
+        # BN hurts performance for pong
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+
+        conv_out_size = self._get_conv_out(input_shape)
+        self.fc_A = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.fc_V = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
+        )
+        
+    def _get_conv_out(self, shape):
+        o = self.conv(torch.zeros(1, *shape))
+        return int(np.prod(o.size()))
+
+    def forward(self, x):
+        conv_out = self.conv(x).view(x.size()[0], -1)
+        A = self.fc_A(conv_out)
+        return self.fc_V(conv_out) + A - A.mean(1,keepdim=True)
 
 class ExperienceBuffer:
     def __init__(self, capacity):
@@ -70,15 +100,41 @@ class ExperienceBuffer:
     @staticmethod 
     def convert(x):
         return torch.tensor(np.array(x)).to(device)
-    
-class Agent(object):
-    def __init__(self, model: nn.Module, tgt: nn.Module, opt: Optimizer, action_space: int, gamma: float, clip: float):
+
+class BaseDQNAgent(object):
+    def __init__(self, model: nn.Module, tgt: nn.Module, opt: Optimizer, \
+                 action_space: int, gamma: float, clip: float, UseMaxOnly: bool):
+        '''
+        
+        Parameters
+        ----------
+        model : nn.Module
+            DESCRIPTION.
+        tgt : nn.Module
+            DESCRIPTION.
+        opt : Optimizer
+            DESCRIPTION.
+        action_space : int
+            dimention of action space.
+        gamma : float
+            DESCRIPTION.
+        clip : float
+            DESCRIPTION.
+        UseMaxOnly : bool
+            use max q(s,a) or E[q(s,a)], expection is with respect to eps-greedy policy
+
+        Returns
+        -------
+        None.
+
+        '''
         self.model = model
         self.tgt = tgt
         self.opt = opt
         self.action_space = action_space
         self.gamma = gamma
         self.clip = clip
+        self.UseMaxOnly = UseMaxOnly
         
     def copy(self):
         self.tgt.load_state_dict(self.model.state_dict())
@@ -90,9 +146,9 @@ class Agent(object):
             return out
         state = torch.tensor(state[None],dtype=torch.float32).to(device)
         with torch.no_grad():
-            #self.model.eval()
+            # self.model.eval()
             out = self.model(state).max(1)[1]
-            #self.model.train()
+            # self.model.train()
             return out.item()
     
     def acts(self,states: np.ndarray, eps: float) -> np.ndarray:
@@ -101,17 +157,26 @@ class Agent(object):
             return np.random.randint(0,self.action_space,states.shape[0])
         states = torch.tensor(states,dtype=torch.float32).to(device)
         with torch.no_grad():
-            self.model.eval()
+            # self.model.eval()
             out = self.model(states).max(1)[1]
-            self.model.train()
+            # self.model.train()
             return out.cpu().numpy()
-        
-    def update(self, batch: List[torch.Tensor]):
+
+    
+class DQNAgent(BaseDQNAgent):       
+    def update(self, batch: List[torch.Tensor], eps: float):
         # notDones is one, when done is False, zero otherwise
         states, actions, rewards, notDones, next_states = batch
-        #pdb.set_trace()
         with torch.no_grad():
-            tgts = rewards + notDones * self.gamma * self.tgt(next_states).max(1)[0]
+            if self.UseMaxOnly:
+                tgts = rewards + notDones * self.gamma * self.tgt(next_states).max(1)[0]
+            else:
+                n = rewards.shape[0]
+                prob = torch.ones(n,self.action_space,dtype=torch.float32,device=device)*eps/self.action_space
+                q = self.tgt(next_states)
+                max_index = q.max(1)[1]
+                prob[range(n),max_index] = eps/self.action_space + 1 - eps
+                tgts = rewards + notDones * self.gamma * (q*prob).sum(1)
         yhat = self.model(states).gather(1,actions).squeeze(1)        
         loss = F.smooth_l1_loss(yhat,tgts)
         with amp.scale_loss(loss, self.opt) as scaled_loss:
@@ -120,8 +185,31 @@ class Agent(object):
         self.opt.step()
         self.opt.zero_grad()
 
+class DoubleDQNAgent(BaseDQNAgent):       
+    def update(self, batch: List[torch.Tensor], eps: float):
+        # notDones is one, when done is False, zero otherwise
+        states, actions, rewards, notDones, next_states = batch
+        n = rewards.shape[0]
+        with torch.no_grad():
+            if self.UseMaxOnly:
+                max_index = self.model(next_states).max(1)[1]
+                tgts = rewards + notDones * self.gamma * self.tgt(next_states)[range(n),max_index]
+            else:
+                prob = torch.ones(n,self.action_space,dtype=torch.float32,device=device)*eps/self.action_space
+                max_index = self.model(next_states).max(1)[1]
+                prob[range(n),max_index] = eps/self.action_space + 1 - eps
+                tgts = rewards + notDones * self.gamma * (self.tgt(next_states)*prob).sum(1)
+        yhat = self.model(states).gather(1,actions).squeeze(1)        
+        loss = F.smooth_l1_loss(yhat,tgts)
+        with amp.scale_loss(loss, self.opt) as scaled_loss:
+            scaled_loss.backward()
+        clip_grad_value_(amp.master_params(self.opt),self.clip)
+        self.opt.step()
+        self.opt.zero_grad()
 
 def Trainer(ENV_NAME,
+            Agent,
+            Model,
             episode=1000,
             GAMMA = 0.99,
             BATCH_SIZE = 32,
@@ -134,18 +222,19 @@ def Trainer(ENV_NAME,
             EPSILON_FINAL = 0.02,
             clip = 2.0,
             report_freq=10,
-            opt_level='O0'):
+            opt_level='O0',
+            UseMaxOnly=True):
     
     # setup
     since = time.time()
     env = make_env(ENV_NAME)
-    model = DQN(env.observation_space.shape, env.action_space.n).to(device)
-    tgt = DQN(env.observation_space.shape, env.action_space.n).to(device)
+    model = Model(env.observation_space.shape, env.action_space.n).to(device)
+    tgt = Model(env.observation_space.shape, env.action_space.n).to(device)
     tgt.eval()
-    opt = Adam(model.parameters(), lr=LEARNING_RATE)
+    opt = Adam(model.parameters(), lr=LEARNING_RATE,betas=(0.8,0.9))
     model, opt = amp.initialize(model, opt, opt_level=opt_level)
     buffer = ExperienceBuffer(REPLAY_SIZE)
-    agent = Agent(model,tgt,opt,env.action_space.n,GAMMA,clip)
+    agent = Agent(model,tgt,opt,env.action_space.n,GAMMA,clip,UseMaxOnly=UseMaxOnly)
     
     tot_rewards = []
     frame_idx = 0
@@ -160,7 +249,6 @@ def Trainer(ENV_NAME,
             # generate experience
             eps = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
             action = agent.act(s,eps)
-            #pdb.set_trace()
             s_next,r,done,_ = env.step(action)
             rewards += r
             buffer.append((np.float32(s), \
@@ -172,10 +260,9 @@ def Trainer(ENV_NAME,
             frame_idx += 1
             if frame_idx < REPLAY_START_SIZE: continue
                 
-        
             # train model
             batch = buffer.sample(BATCH_SIZE)
-            agent.update(batch)
+            agent.update(batch,eps)
             if frame_idx % SYNC_TARGET_FRAMES == 0: agent.copy()
                 
         tot_rewards.append(rewards)
@@ -190,9 +277,21 @@ def Trainer(ENV_NAME,
                 print('Training completed in {} mins with {} episode'.format(time_elapsed/60,i))
                 return model
             
+def play(env,agent):
+    s = env.reset()
+    done = False
+    tot_r = 0
+    while not done:
+        a = agent.act(s,0)
+        s,r,done,_ = env.step(a)
+        tot_r += r
+        env.render()
+        time.sleep(0.1)
+    env.close()
+    print('total rewards is :{}'.format(tot_r))
     
 if __name__ == "__main__":
-    model = Trainer('PongNoFrameskip-v4')
-    if model is not None:
-        torch.save(model.state_dict(), '/home/will/Desktop/kaggle/RL/dqn.bin')
+    model = Trainer('PongNoFrameskip-v4',DoubleDQNAgent,DuelDQN,UseMaxOnly=False)
+    # if model is not None:
+    #     torch.save(model.state_dict(), '/home/will/Desktop/kaggle/RL/dqn.bin')
     
