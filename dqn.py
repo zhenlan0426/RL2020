@@ -16,7 +16,7 @@ import collections
 from wrappers import make_env
 import time
 from typing import List
-#import pdb pdb.set_trace()
+import pdb 
 device = 'cuda'
 
 class DQN(nn.Module):
@@ -101,6 +101,48 @@ class ExperienceBuffer:
     def convert(x):
         return torch.tensor(np.array(x)).to(device)
 
+class PrioReplayBuffer:
+    def __init__(self, capacity,max_=1e-3):
+        self.buffer = []
+        self.error = np.ones(capacity,dtype=np.float32) * max_
+        self.max = max_
+        self.pos = 0
+        self.capacity = capacity
+        
+    def __len__(self):
+        return len(self.buffer)
+        
+    def append(self, experience):
+        if self.full_capacity():
+            self.error[self.pos] = self.max
+            self.buffer[self.pos] = experience
+            self.pos = (self.pos + 1) % self.capacity
+        else:
+            self.buffer.append(experience)
+        
+    def update(self,index,error):
+        self.error[index] = error
+        self.max = max(self.max,np.max(error))
+        
+    def sample(self, batch_size,alpha,beta):
+        assert self.full_capacity()
+        prob = self.error ** alpha
+        prob /= prob.sum()
+        indices = np.random.choice(self.capacity, batch_size, p=prob)
+        weight = (prob[indices]*self.capacity) ** (-beta)
+        weight /= weight.max()
+        # pdb.set_trace()
+        states, actions, rewards, dones, next_states = zip(*[self.buffer[idx] for idx in indices])
+        return (self.convert(states), self.convert(actions), self.convert(rewards), \
+               self.convert(dones), self.convert(next_states), torch.tensor(weight.astype(np.float32)).to(device)), indices
+
+    @staticmethod 
+    def convert(x):
+        return torch.tensor(np.array(x)).to(device)
+        
+    def full_capacity(self):
+        return len(self) == self.capacity
+        
 class BaseDQNAgent(object):
     def __init__(self, model: nn.Module, tgt: nn.Module, opt: Optimizer, \
                  action_space: int, gamma: float, clip: float, UseMaxOnly: bool):
@@ -188,7 +230,7 @@ class DQNAgent(BaseDQNAgent):
 class DoubleDQNAgent(BaseDQNAgent):       
     def update(self, batch: List[torch.Tensor], eps: float):
         # notDones is one, when done is False, zero otherwise
-        states, actions, rewards, notDones, next_states = batch
+        states, actions, rewards, notDones, next_states, weights = batch
         n = rewards.shape[0]
         with torch.no_grad():
             if self.UseMaxOnly:
@@ -200,28 +242,36 @@ class DoubleDQNAgent(BaseDQNAgent):
                 prob[range(n),max_index] = eps/self.action_space + 1 - eps
                 tgts = rewards + notDones * self.gamma * (self.tgt(next_states)*prob).sum(1)
         yhat = self.model(states).gather(1,actions).squeeze(1)        
-        loss = F.smooth_l1_loss(yhat,tgts)
+        loss = F.smooth_l1_loss(yhat,tgts,reduction='none')
+        loss_np = loss.detach().cpu().numpy()
+        loss = torch.mean(loss * weights)
         with amp.scale_loss(loss, self.opt) as scaled_loss:
             scaled_loss.backward()
         clip_grad_value_(amp.master_params(self.opt),self.clip)
         self.opt.step()
         self.opt.zero_grad()
+        return loss_np
 
 def Trainer(ENV_NAME,
             Agent,
             Model,
-            episode=1000,
+            Buffer,
+            episode=50000,
             GAMMA = 0.99,
             BATCH_SIZE = 32,
-            REPLAY_SIZE = 10000,
+            REPLAY_SIZE = 100000,
             LEARNING_RATE = 1e-4,
-            SYNC_TARGET_FRAMES = 1000,
-            REPLAY_START_SIZE = 10000,
-            EPSILON_DECAY_LAST_FRAME = 10**5,
+            SYNC_TARGET_FRAMES = 5000,
+            #REPLAY_START_SIZE = 10000,
+            EPSILON_DECAY_LAST_FRAME = 5*10**6,
             EPSILON_START = 1.0,
             EPSILON_FINAL = 0.02,
-            clip = 2.0,
-            report_freq=10,
+            beta_start = 0.4,
+            beta_end = 1.0,
+            alpha_start = 0.4,
+            alpha_end = 1.0,
+            clip = 1.0,
+            report_freq=50,
             opt_level='O0',
             UseMaxOnly=True):
     
@@ -231,16 +281,17 @@ def Trainer(ENV_NAME,
     model = Model(env.observation_space.shape, env.action_space.n).to(device)
     tgt = Model(env.observation_space.shape, env.action_space.n).to(device)
     tgt.eval()
-    opt = Adam(model.parameters(), lr=LEARNING_RATE,betas=(0.8,0.9))
+    opt = Adam(model.parameters(), lr=LEARNING_RATE)
     model, opt = amp.initialize(model, opt, opt_level=opt_level)
-    buffer = ExperienceBuffer(REPLAY_SIZE)
+    buffer = Buffer(REPLAY_SIZE)
     agent = Agent(model,tgt,opt,env.action_space.n,GAMMA,clip,UseMaxOnly=UseMaxOnly)
     
     tot_rewards = []
     frame_idx = 0
     ts_frame = 0
     ts = time.time()
-            
+    REPLAY_START_SIZE = REPLAY_SIZE
+    
     for i in range(episode):
         done = False
         rewards = 0 
@@ -248,6 +299,8 @@ def Trainer(ENV_NAME,
         while not done:
             # generate experience
             eps = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
+            alpha = min(alpha_end, alpha_start + frame_idx / EPSILON_DECAY_LAST_FRAME)
+            beta = min(beta_end, beta_start + frame_idx / EPSILON_DECAY_LAST_FRAME)
             action = agent.act(s,eps)
             s_next,r,done,_ = env.step(action)
             rewards += r
@@ -261,8 +314,9 @@ def Trainer(ENV_NAME,
             if frame_idx < REPLAY_START_SIZE: continue
                 
             # train model
-            batch = buffer.sample(BATCH_SIZE)
-            agent.update(batch,eps)
+            batch,index = buffer.sample(BATCH_SIZE,alpha,beta)
+            error = agent.update(batch,eps)
+            buffer.update(index,error)
             if frame_idx % SYNC_TARGET_FRAMES == 0: agent.copy()
                 
         tot_rewards.append(rewards)
@@ -272,7 +326,7 @@ def Trainer(ENV_NAME,
             ts = time.time()
             mean_r = np.mean(tot_rewards[-report_freq:])
             print('episode:{}, frame:{}, reward:{}, speed:{}'.format(i,frame_idx,mean_r,speed))
-            if mean_r > 19: 
+            if mean_r > 500: 
                 time_elapsed = time.time() - since
                 print('Training completed in {} mins with {} episode'.format(time_elapsed/60,i))
                 return model
@@ -291,7 +345,7 @@ def play(env,agent):
     print('total rewards is :{}'.format(tot_r))
     
 if __name__ == "__main__":
-    model = Trainer('PongNoFrameskip-v4',DoubleDQNAgent,DuelDQN,UseMaxOnly=False)
+    model = Trainer('BreakoutNoFrameskip-v4',DoubleDQNAgent,DuelDQN,PrioReplayBuffer,UseMaxOnly=False)
     # if model is not None:
     #     torch.save(model.state_dict(), '/home/will/Desktop/kaggle/RL/dqn.bin')
     
