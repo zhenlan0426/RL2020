@@ -127,3 +127,27 @@ def make_env(env_name):
     env = ImageToPyTorch(env)
     env = BufferWrapper(env, 4)
     return ScaledFloatFrame(env)
+
+
+class VecEnv(object):
+    def __init__(self,make_env,name,n):
+        self.envs = [make_env(name) for _ in range(n)]
+        self.observation_space = self.envs[0].observation_space
+        self.action_space = self.envs[0].action_space
+        
+    def reset(self):
+        out = []
+        for env in self.envs:
+            out.append(env.reset())
+        return out
+    
+    def step(self,actions):
+        s_nexts,rs,dones = [],[],[]
+        for env,action in zip(self.envs,actions):
+            s_next,r,done,_ = env.step(action)
+            if done:
+                s_next = env.reset()
+            s_nexts.append(s_next)
+            rs.append(r)
+            dones.append(done)
+        return s_nexts,rs,dones

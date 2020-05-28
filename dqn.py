@@ -13,10 +13,10 @@ from torch.nn.utils import clip_grad_value_
 import numpy as np
 from apex import amp
 import collections
-from wrappers import make_env
+from wrappers import make_env, VecEnv
 import time
 from typing import List
-import pdb 
+# import pdb 
 device = 'cuda'
 
 class DQN(nn.Module):
@@ -193,11 +193,11 @@ class BaseDQNAgent(object):
             # self.model.train()
             return out.item()
     
-    def acts(self,states: np.ndarray, eps: float) -> np.ndarray:
+    def acts(self,states: List[np.ndarray], eps: float) -> np.ndarray:
         # state should be shape (n,...)
         if np.random.rand() < eps:
-            return np.random.randint(0,self.action_space,states.shape[0])
-        states = torch.tensor(states,dtype=torch.float32).to(device)
+            return np.random.randint(0,self.action_space,len(states))
+        states = torch.tensor(np.array(states),dtype=torch.float32).to(device)
         with torch.no_grad():
             # self.model.eval()
             out = self.model(states).max(1)[1]
@@ -261,15 +261,15 @@ def Trainer(ENV_NAME,
             BATCH_SIZE = 32,
             REPLAY_SIZE = 100000,
             LEARNING_RATE = 1e-4,
-            SYNC_TARGET_FRAMES = 5000,
+            SYNC_TARGET_FRAMES = 1000,
             #REPLAY_START_SIZE = 10000,
             EPSILON_DECAY_LAST_FRAME = 5*10**6,
             EPSILON_START = 1.0,
-            EPSILON_FINAL = 0.02,
+            EPSILON_FINAL = 0.05,
             beta_start = 0.4,
             beta_end = 1.0,
             alpha_start = 0.4,
-            alpha_end = 1.0,
+            alpha_end = 0.8,
             clip = 1.0,
             report_freq=50,
             opt_level='O0',
@@ -315,7 +315,7 @@ def Trainer(ENV_NAME,
                 
             # train model
             batch,index = buffer.sample(BATCH_SIZE,alpha,beta)
-            error = agent.update(batch,eps)
+            error = agent.update(batch,eps) + 1e-10
             buffer.update(index,error)
             if frame_idx % SYNC_TARGET_FRAMES == 0: agent.copy()
                 
@@ -329,6 +329,89 @@ def Trainer(ENV_NAME,
             if mean_r > 500: 
                 time_elapsed = time.time() - since
                 print('Training completed in {} mins with {} episode'.format(time_elapsed/60,i))
+                return model
+
+def VecTrainer(ENV_NAME,
+                Agent,
+                Model,
+                Buffer,
+                GAMMA = 0.99,
+                BATCH_SIZE = 1024,
+                REPLAY_SIZE = 100000,
+                LEARNING_RATE = 6e-4,
+                SYNC_TARGET_FRAMES = 1024,
+                #REPLAY_START_SIZE = 10000,
+                EPSILON_DECAY_LAST_FRAME = 5*10**6,
+                EPSILON_START = 1.0,
+                EPSILON_FINAL = 0.05,
+                beta_start = 0.4,
+                beta_end = 1.0,
+                alpha_start = 0.4,
+                alpha_end = 0.8,
+                clip = 1.0,
+                report_freq=1024*8,
+                opt_level='O0',
+                UseMaxOnly=True,
+                n_env = 32):
+    
+    
+    # setup
+    since = time.time()
+    env = VecEnv(make_env, ENV_NAME, n=n_env)
+    model = Model(env.observation_space.shape, env.action_space.n).to(device)
+    tgt = Model(env.observation_space.shape, env.action_space.n).to(device)
+    tgt.eval()
+    opt = Adam(model.parameters(), lr=LEARNING_RATE)
+    model, opt = amp.initialize(model, opt, opt_level=opt_level)
+    buffer = Buffer(REPLAY_SIZE)
+    agent = Agent(model,tgt,opt,env.action_space.n,GAMMA,clip,UseMaxOnly=UseMaxOnly)
+    
+    tot_rewards = []
+    frame_idx = 0
+    ts_frame = 0
+    ts = time.time()
+    REPLAY_START_SIZE = REPLAY_SIZE
+    s = env.reset()
+    rewards = np.zeros(n_env)
+    
+    while True:
+        # generate experience
+        eps = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
+        alpha = min(alpha_end, alpha_start + frame_idx / EPSILON_DECAY_LAST_FRAME)
+        beta = min(beta_end, beta_start + frame_idx / EPSILON_DECAY_LAST_FRAME)
+        action = agent.acts(s,eps)
+        s_next,r,done = env.step(action)
+        
+        rewards += np.array(r)
+        done_index = np.array(done)
+        tot_rewards.extend(rewards[done_index])
+        rewards[done_index] = 0
+        
+        for i in range(n_env):
+            buffer.append((np.float32(s[i]), \
+                           np.array([action[i]],dtype=np.int64),\
+                           np.float32(r[i]), \
+                           np.float32(1-done[i]), \
+                           np.float32(s_next[i])))
+        s = s_next
+        frame_idx += n_env
+        if frame_idx < REPLAY_START_SIZE: continue
+            
+        # train model
+        batch,index = buffer.sample(BATCH_SIZE,alpha,beta)
+        error = agent.update(batch,eps) + 1e-10
+        buffer.update(index,error)
+        if frame_idx % SYNC_TARGET_FRAMES == 0: agent.copy()
+            
+        if frame_idx % report_freq == 0:
+            speed = (frame_idx - ts_frame) / (time.time() - ts)
+            ts_frame = frame_idx
+            ts = time.time()
+            mean_r = np.mean(tot_rewards[-10:])
+            print('episode:{}, frame:{}, reward:{}, speed:{}'.format(len(tot_rewards),frame_idx,mean_r,speed))
+            if mean_r > 500: 
+                time_elapsed = time.time() - since
+                print('Training completed in {} mins with {} episode'.format(time_elapsed/60,len(tot_rewards)))
                 return model
             
 def play(env,agent):
@@ -345,7 +428,7 @@ def play(env,agent):
     print('total rewards is :{}'.format(tot_r))
     
 if __name__ == "__main__":
-    model = Trainer('BreakoutNoFrameskip-v4',DoubleDQNAgent,DuelDQN,PrioReplayBuffer,UseMaxOnly=False)
+    model = VecTrainer('BreakoutNoFrameskip-v4',DoubleDQNAgent,DuelDQN,PrioReplayBuffer,UseMaxOnly=False)
     # if model is not None:
     #     torch.save(model.state_dict(), '/home/will/Desktop/kaggle/RL/dqn.bin')
     
