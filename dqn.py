@@ -102,9 +102,10 @@ class ExperienceBuffer:
         return torch.tensor(np.array(x)).to(device)
 
 class PrioReplayBuffer:
-    def __init__(self, capacity,max_=1e-3):
+    def __init__(self, capacity,max_=1e-6):
         self.buffer = []
         self.error = np.ones(capacity,dtype=np.float32) * max_
+        self.rewards = np.ones(capacity,dtype=np.float32)
         self.max = max_
         self.pos = 0
         self.capacity = capacity
@@ -112,16 +113,17 @@ class PrioReplayBuffer:
     def __len__(self):
         return len(self.buffer)
         
-    def append(self, experience):
+    def append(self, experience,r):
+        self.rewards[self.pos] = np.sqrt(1+r)
+        self.error[self.pos] = self.max * self.rewards[self.pos]
         if self.full_capacity():
-            self.error[self.pos] = self.max
             self.buffer[self.pos] = experience
-            self.pos = (self.pos + 1) % self.capacity
         else:
             self.buffer.append(experience)
+        self.pos = (self.pos + 1) % self.capacity
         
     def update(self,index,error):
-        self.error[index] = error
+        self.error[index] = error * self.rewards[index]
         self.max = max(self.max,np.max(error))
         
     def sample(self, batch_size,alpha,beta):
@@ -133,6 +135,8 @@ class PrioReplayBuffer:
         weight /= weight.max()
         # pdb.set_trace()
         states, actions, rewards, dones, next_states = zip(*[self.buffer[idx] for idx in indices])
+        # data augment
+        next_states = [(i[...,::-1] if np.random.rand() < 0.5 else i) for i in next_states]
         return (self.convert(states), self.convert(actions), self.convert(rewards), \
                self.convert(dones), self.convert(next_states), torch.tensor(weight.astype(np.float32)).to(device)), indices
 
@@ -341,12 +345,12 @@ def VecTrainer(ENV_NAME,
                 LEARNING_RATE = 6e-4,
                 SYNC_TARGET_FRAMES = 1024,
                 #REPLAY_START_SIZE = 10000,
-                EPSILON_DECAY_LAST_FRAME = 5*10**6,
+                EPSILON_DECAY_LAST_FRAME = 10**7,
                 EPSILON_START = 1.0,
-                EPSILON_FINAL = 0.05,
+                EPSILON_FINAL = 0.1,
                 beta_start = 0.4,
                 beta_end = 1.0,
-                alpha_start = 0.4,
+                alpha_start = 0.2,
                 alpha_end = 0.8,
                 clip = 1.0,
                 report_freq=1024*8,
@@ -392,7 +396,7 @@ def VecTrainer(ENV_NAME,
                            np.array([action[i]],dtype=np.int64),\
                            np.float32(r[i]), \
                            np.float32(1-done[i]), \
-                           np.float32(s_next[i])))
+                           np.float32(s_next[i])),rewards[i])
         s = s_next
         frame_idx += n_env
         if frame_idx < REPLAY_START_SIZE: continue
@@ -407,9 +411,9 @@ def VecTrainer(ENV_NAME,
             speed = (frame_idx - ts_frame) / (time.time() - ts)
             ts_frame = frame_idx
             ts = time.time()
-            mean_r = np.mean(tot_rewards[-10:])
+            mean_r = np.mean(tot_rewards[-500:])
             print('episode:{}, frame:{}, reward:{}, speed:{}'.format(len(tot_rewards),frame_idx,mean_r,speed))
-            if mean_r > 500: 
+            if mean_r > 100: 
                 time_elapsed = time.time() - since
                 print('Training completed in {} mins with {} episode'.format(time_elapsed/60,len(tot_rewards)))
                 return model
