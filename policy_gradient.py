@@ -19,8 +19,6 @@ from typing import List
 device = 'cuda'
 
 
-
-
 class net(nn.Module):
     def __init__(self, input_shape, n_actions):
         super(net, self).__init__()
@@ -36,8 +34,7 @@ class net(nn.Module):
         self.fc_policy = nn.Sequential(
             nn.Linear(conv_out_size, 512),
             nn.ReLU(),
-            nn.Linear(512, n_actions),
-            nn.Softmax(1)
+            nn.Linear(512, n_actions)
         )
         self.fc_V = nn.Sequential(
             nn.Linear(conv_out_size, 512),
@@ -51,45 +48,46 @@ class net(nn.Module):
 
     def forward(self, x):
         conv_out = self.conv(x).view(x.size()[0], -1)
-        probs = self.fc_policy(conv_out)
+        logits = self.fc_policy(conv_out)
         value = self.fc_V(conv_out).squeeze(1)
-        return probs,value
+        return logits,value
 
+    def get_value(self,x):
+        with torch.no_grad():
+            conv_out = self.conv(x).view(x.size()[0], -1)
+            return self.fc_V(conv_out).squeeze(1)
+        
+        
 class A2C_agent(object):
     def __init__(self,net: nn.Module, opt: Optimizer, \
-                 gamma: float, clip: float):
+                 gamma: float, clip: float, update_freq=50):
         self.net = net
         self.opt = opt
         self.gamma = gamma
         self.clip = clip
+        self.update_freq = update_freq
+        self.counter = 0
         
-    def act(self,s,overwrite=False):
+    def act(self,s):
         # call act with overwrite=True at beginging
-        probs,value = self.net(s)
-        rv = Categorical(probs)
+        logits,value = self.net(s)
+        rv = Categorical(logits=logits)
         action = rv.sample()
-        if overwrite:
-            self.last_log_prob = rv.log_prob(action)
-            self.last_value = value
-            return action.cpu().numpy()
-        else:
-            return action.cpu().numpy(), rv.log_prob(action), value
+        return action.cpu().numpy(), rv.log_prob(action), value
     
-    def act_update(self,s,r,notDones):
-        action,log_prob,value = self.act(s)
-        delta = r + notDones * self.gamma * value.detach() - self.last_value
-        loss_A = torch.mean(-self.last_log_prob * delta.detach())
+    def update(self,s_p,r,notDones,log_prob,value):
+        value_p = self.net.get_value(s_p)
+        delta = r + notDones * self.gamma * value_p - value
+        loss_A = torch.mean(-log_prob * delta.detach())
         loss_B = torch.mean(torch.abs(delta))
         loss = loss_A + loss_B
         
-        self.last_log_prob = log_prob
-        self.last_value = value
-        
         loss.backward()
-        clip_grad_value_(self.net.parameters(), self.clip)        
-        self.opt.step()
-        self.opt.zero_grad()
-        return action
+        clip_grad_value_(self.net.parameters(), self.clip)
+        self.counter += 1
+        if self.counter % self.update_freq == 0:
+            self.opt.step()
+            self.opt.zero_grad()
         
 def listofnp2torch(x: List[np.ndarray], dtype):
     return torch.tensor(np.array(x),dtype=dtype).to(device)
@@ -101,12 +99,12 @@ def np2torch(s_next,r,done):
     return torch.tensor(s_next).to(device),torch.tensor(r).to(device),torch.tensor(1-done).to(device)
 
 ENV_NAME = 'PongNoFrameskip-v4'
-n_env = 64
-LEARNING_RATE = 1e-4
+n_env = 128
+LEARNING_RATE = 1e-5
 gamma = 0.99
 clip = 1.0
 max_steps = 100000
-report_freq = 20
+report_freq = 500
 
 since = time.time()
 env = VecEnv(make_env, ENV_NAME, n=n_env)
@@ -114,24 +112,12 @@ model = net(env.observation_space.shape, env.action_space.n).to(device)
 opt = Adam(model.parameters(), lr=LEARNING_RATE)    
 agent = A2C_agent(model,opt,gamma,clip)
 
-
 tot_rewards = []
 rewards = np.zeros(n_env)
-
 s = listofnp2torch(env.reset(),torch.float32)
-action = agent.act(s,True)
-s_next,r,done = env2np(env.step(action))
-
-# update rewards tracking
-rewards += r
-tot_rewards.extend(rewards[done.astype(np.bool)])
-rewards[done.astype(np.bool)] = 0
-
-# np2torch
-s_next,r,notDone = np2torch(s_next,r,done)
 
 for i in range(max_steps):
-    action = agent.act_update(s_next, r, notDone)
+    action, log_prob, value = agent.act(s)
     s_next,r,done = env2np(env.step(action))
     
     # update rewards tracking
@@ -140,11 +126,12 @@ for i in range(max_steps):
     tot_rewards.extend(rewards[done_index])
     rewards[done_index] = 0
     
-    # np2torch
     s_next,r,notDone = np2torch(s_next,r,done)
+    agent.update(s_next, r, notDone, log_prob, value)
     
+    s = s_next
     if i % report_freq == 0:
-        mean_r = np.mean(tot_rewards[-report_freq:])
+        mean_r = np.mean(tot_rewards[-100:])
         print('steps:{}, episodes:{}, reward:{}'.format(i,len(tot_rewards),mean_r))
         if mean_r > 18: 
             time_elapsed = time.time() - since
